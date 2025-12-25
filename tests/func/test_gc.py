@@ -3,6 +3,7 @@ import logging
 import os
 import shutil
 import textwrap
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -11,6 +12,9 @@ from dvc.exceptions import CollectCacheError, InvalidArgumentError, RevCollectio
 from dvc.fs import LocalFileSystem
 from dvc.utils.fs import remove
 from dvc_data.hashfile.db.local import LocalHashFileDB
+
+if TYPE_CHECKING:
+    from dvc.repo.gc import DryGCEntry
 
 
 @pytest.fixture
@@ -450,3 +454,126 @@ def test_gc_skip_failed(tmp_dir, dvc):
         dvc.gc(force=True, workspace=True)
 
     dvc.gc(force=True, workspace=True, skip_failed=True)
+
+
+@pytest.fixture
+def make_garbage(tmp_dir):
+    def _make_garbage(content, name):
+        (stage,) = tmp_dir.dvc_gen(name, content)
+        os.remove(stage.relpath)
+        return stage.outs[0].hash_info.value
+
+    return _make_garbage
+
+
+def test_gc_dry_reports_correct_garbage_oid(tmp_dir, dvc, mocker, make_garbage):
+    """Verify dry-run correctly identifies and reports garbage object IDs."""
+    tmp_dir.dvc_gen("used", "content")
+    garbage_oid = make_garbage("garbage", "trash")
+
+    mock_print = mocker.patch("dvc.repo.gc._print_gc_report")
+
+    dvc.gc(workspace=True, dry=True)
+
+    results = mock_print.call_args.kwargs["results"]
+    assert len(results) == 1
+    assert results[0]["oid"] == garbage_oid
+
+
+def test_gc_dry_with_cloud(tmp_dir, dvc, local_remote, mocker):
+    (stage,) = tmp_dir.dvc_gen("file", "content")
+    oid = stage.outs[0].hash_info.value
+    dvc.push()
+    os.remove(stage.relpath)
+
+    remote_odb = dvc.cloud.get_remote_odb()
+    local_odb = dvc.cache.local
+
+    mock_print = mocker.patch("dvc.repo.gc._print_gc_report")
+
+    dvc.gc(workspace=True, cloud=True, dry=True)
+
+    results = mock_print.call_args.kwargs["results"]
+    paths = [entry["path"] for entry in results]
+
+    assert len(results) == 2
+
+    assert any(local_odb.path in path for path in paths)
+    assert any(remote_odb.path in path for path in paths)
+
+    assert remote_odb.exists(oid)
+    assert local_odb.exists(oid)
+
+
+def test_gc_dry_with_corrupted_cache(tmp_dir, dvc):
+    """
+    Verifies `gc --dry` survives filesystem errors
+    when fetching file metadata for its report.
+    """
+    (stage,) = tmp_dir.dvc_gen("file", "content")
+    cache_path = stage.outs[0].cache_path
+    os.remove(stage.relpath)
+
+    os.remove(cache_path)
+
+    # no error should be raised
+    dvc.gc(workspace=True, dry=True, force=True)
+
+
+def test_gc_dry_format_report_lines():
+    """Verifies the complete GC report is assembled correctly."""
+    from dvc.repo.gc import ObjectType, _format_report_lines
+
+    now = datetime.datetime.now(tz=datetime.timezone.utc).astimezone()
+    test_results: list[DryGCEntry] = [
+        {
+            "oid": "a1b2c3d4e5f6g7h8",
+            "type": ObjectType.FILE,
+            "size": 12345,  # Should be formatted as 12.1K
+            "mtime": now.timestamp(),
+            "path": "/fake/path/to/a1b2c3d4",
+        },
+        {
+            "oid": "f9e8d7c6b5a4",
+            "type": ObjectType.DIR,
+            "size": None,  # Should be formatted as "-"
+            "mtime": None,
+            "path": "/fake/path/to/f9e8d7c6.dir",
+        },
+    ]
+
+    lines = _format_report_lines(test_results)
+    assert len(lines) == 5
+
+    summary, headers, divider, first_row, second_row = (
+        lines[0],
+        lines[1],
+        lines[2],
+        lines[3],
+        lines[4],
+    )
+
+    assert "total 2 objects" in summary
+    assert "12.1k" in summary
+
+    assert headers.startswith("Type  OID")
+
+    assert divider.startswith("----  --------")
+
+    assert first_row.startswith(ObjectType.FILE.value)
+    assert "a1b2c3d4" in first_row
+    assert "12.1k" in first_row
+    assert now.strftime("%Y-%m-%d") in first_row
+
+    assert second_row.startswith(ObjectType.DIR.value)
+    assert "f9e8d7c6" in second_row
+    assert " - " in second_row
+    assert "  -  " in second_row
+
+
+def test_gc_dry_report_empty():
+    from dvc.repo.gc import _format_report_lines
+
+    empty_results: list[DryGCEntry] = []
+    lines = _format_report_lines(empty_results)
+    assert lines == ["total 0 objects, 0B reclaimed"]

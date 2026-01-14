@@ -129,6 +129,36 @@ class Config(dict):
             return system_config_dir()
         return None
 
+    @property
+    def _should_prefer_local_dvc_dir(self) -> bool:
+        """Check if we should prefer local_dvc_dir over dvc_dir for reading config.
+
+        Returns True when we should use local_dvc_dir instead of dvc_dir:
+        - This happens in brancher/gc scenarios where fs is switched to GitFileSystem
+          to traverse commits, but we still need to read complete config from workspace
+          (e.g., config.local with passwords)
+        - Detected by: local_dvc_dir exists, differs from dvc_dir, and has config file
+
+        Returns False when we should use dvc_dir:
+        - Repo(rev="...") scenario: explicitly reading config from a specific revision
+          (dvc_dir is a git root path, workspace has no config)
+        - Normal workspace: local_dvc_dir equals dvc_dir, no preference needed
+        """
+        if self.local_dvc_dir is None or self.local_dvc_dir == self.dvc_dir:
+            return False
+
+        # Check if dvc_dir is a git root path (e.g., "/.dvc")
+        # Git paths use posix separators, so check if parent dir is posix root
+        if self.dvc_dir and posixpath.dirname(self.dvc_dir) == posixpath.sep:
+            # When dvc_dir is a git root path, check if workspace has config
+            # If workspace has config, prefer it (brancher scenario)
+            # If not, use dvc_dir from git history (Repo(rev="...") scenario)
+            workspace_config = self.wfs.join(self.local_dvc_dir, self.CONFIG)
+            return self.wfs.exists(workspace_config)
+
+        # Otherwise, this is brancher scenario with non-root path
+        return True
+
     @cached_property
     def files(self) -> dict[str, str]:
         files = {
@@ -136,12 +166,23 @@ class Config(dict):
             for level in ("system", "global")
         }
 
-        # For repo level, use local_dvc_dir if available (when fs is GitFileSystem),
-        # otherwise use dvc_dir (when fs is LocalFileSystem)
-        repo_dvc_dir = self.local_dvc_dir if self.local_dvc_dir else self.dvc_dir
-        if repo_dvc_dir is not None:
-            files["repo"] = self.wfs.join(repo_dvc_dir, self.CONFIG)
+        # Determine which dvc_dir and filesystem to use for repo config
+        repo_fs: FileSystem
+        if self._should_prefer_local_dvc_dir:
+            # Scenario: brancher switched fs, but need to read workspace config
+            # Use workspace path and filesystem
+            repo_dvc_dir = self.local_dvc_dir
+            repo_fs = self.wfs
+        else:
+            # Scenario: Repo(rev="...") or normal workspace
+            # Use self.fs (may be GitFileSystem for reading from git history)
+            repo_dvc_dir = self.dvc_dir
+            repo_fs = self.fs
 
+        if repo_dvc_dir is not None:
+            files["repo"] = repo_fs.join(repo_dvc_dir, self.CONFIG)
+
+        # Local config always from workspace if it exists
         if self.local_dvc_dir is not None:
             files["local"] = self.wfs.join(self.local_dvc_dir, self.CONFIG_LOCAL)
 
@@ -198,12 +239,32 @@ class Config(dict):
 
         self.update(conf)
 
-    def _get_fs(self, level):  # noqa: ARG002
-        # NOTE: Always use wfs (LocalFileSystem) for all config levels.
-        # - system/global: outside repo, must use wfs
-        # - repo/local: should read from current workspace, not git history
-        # This prevents loading incomplete configs from git history
-        # during gc --all-commits.
+    def _get_fs(self, level):
+        """Get filesystem for reading config at the specified level.
+
+        Args:
+            level: Config level ("system", "global", "repo", "local")
+
+        Returns:
+            FileSystem to use for reading config
+        """
+        # system/global are always outside repo, must use wfs
+        if level in ("system", "global"):
+            return self.wfs
+
+        # local config always from workspace
+        if level == "local":
+            return self.wfs
+
+        # repo config depends on whether we have separate workspace
+        if level == "repo":
+            if self._should_prefer_local_dvc_dir:
+                # Prefer local_dvc_dir: use workspace config (brancher scenario)
+                return self.wfs
+            # Use dvc_dir: may be from git history or normal workspace
+            return self.fs
+
+        # Fallback to wfs
         return self.wfs
 
     @staticmethod

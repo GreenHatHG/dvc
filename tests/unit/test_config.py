@@ -126,6 +126,15 @@ def test_get_fs_brancher_scenario(tmp_dir, scm):
     assert config._get_fs("system") == config.wfs
 
 
+def test_get_fs_invalid_level(tmp_dir, dvc):
+    """Test _get_fs raises ValueError for invalid config level."""
+    config = Config.from_cwd(validate=False)
+
+    # Test that passing an invalid level raises ValueError
+    with pytest.raises(ValueError, match="Invalid config level: 'invalid'"):
+        config._get_fs("invalid")
+
+
 def test_s3_ssl_verify(tmp_dir, dvc):
     config = Config.from_cwd(validate=False)
     with config.edit() as conf:
